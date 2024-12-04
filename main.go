@@ -1,16 +1,24 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
-	"strings"
+	"os"
 	"sync/atomic"
-	"unicode"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/Ayannamdeo/chirpy/internal/database"
+	"github.com/joho/godotenv"
+	_ "github.com/lib/pq"
 )
 
 type apiConfig struct {
+	db             *database.Queries
+	platform       string
 	fileserverHits atomic.Int32
 }
 
@@ -35,26 +43,19 @@ func (cfg *apiConfig) metricsHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (cfg *apiConfig) resetHandler(w http.ResponseWriter, r *http.Request) {
-	cfg.fileserverHits.Store(0)
+  if cfg.platform != "dev" {
+    respondWithError(w, http.StatusForbidden, "Only dev allowed to reset", nil)
+    return
+  }
+  err := cfg.db.DeleteAllUsers(r.Context())
+  if err != nil {
+    respondWithError(w, http.StatusInternalServerError, "Error deleting users", err)
+    return
+  }
+  respondWithJSON(w, http.StatusOK, nil)
+  cfg.fileserverHits.Store(0)
 }
 
-type reqParameters struct {
-	Body string `json:"body"`
-}
-type validResParameters struct {
-	Cleaned_Body string `json:"cleaned_body"`
-}
-
-//	func writeJSON(w http.ResponseWriter, status int, v any) error {
-//		data, err := json.Marshal(v)
-//		if err != nil {
-//			return err
-//		}
-//		w.Header().Set("Content-Type", "application/json")
-//		w.WriteHeader(status)
-//		_, err = w.Write(data)
-//		return err
-//	}
 func respondWithError(w http.ResponseWriter, status int, msg string, err error) {
 	if err != nil {
 		log.Println(err)
@@ -72,11 +73,8 @@ func respondWithError(w http.ResponseWriter, status int, msg string, err error) 
 
 func respondWithJSON(w http.ResponseWriter, status int, payload interface{}) {
 	w.Header().Set("Content-Type", "application/json")
-	log.Println(payload)
 	data, err := json.Marshal(payload)
-	log.Printf("\nmarshal: %v\n", data)
 	if err != nil {
-		log.Printf("Error marshalling JSON: %s", err)
 		w.WriteHeader(500)
 		w.Write(data)
 		return
@@ -85,48 +83,154 @@ func respondWithJSON(w http.ResponseWriter, status int, payload interface{}) {
 	w.Write(data)
 }
 
-func cleanWord(word string) string {
-	var result []rune
-	for _, char := range word {
-		if unicode.IsLetter(char) {
-			result = append(result, char)
-		}
-	}
-	return string(result)
+type chirpsParam struct {
+	Body string `json:"body"`
+  UserId string `json:"user_id"`
 }
 
-func validateHandler(w http.ResponseWriter, r *http.Request) {
+type Chirp struct {
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Body      string    `json:"body"`
+	ID        uuid.UUID `json:"id"`
+	UserID    uuid.UUID `json:"user_id"`
+}
+
+func (cfg *apiConfig) chirpsHandler(w http.ResponseWriter, r *http.Request) {
+  if r.Method != http.MethodPost {
+    respondWithError(w, http.StatusMethodNotAllowed, "method not supported", nil)
+    return
+  }
 	decoder := json.NewDecoder(r.Body)
-	reqbody := reqParameters{}
+	reqbody := chirpsParam{}
 	err := decoder.Decode(&reqbody)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Couldn't decode parameters", err)
 		return
 	}
-	if len(reqbody.Body) > 140 {
-		respondWithError(w, http.StatusBadRequest, "Chirpy is too long", nil)
+	if len(reqbody.Body) > 140 || reqbody.UserId == ""{
+		respondWithError(w, http.StatusBadRequest, "Chirpy is too long or no UserId provided", nil)
 		return
 	}
-	// splitted := strings.Split(strings.ToLower(reqbody.Body), " ")
-	splitted := strings.Split(reqbody.Body, " ")
-	for i, s := range splitted {
-		cleanword := cleanWord(strings.ToLower(s))
-		if cleanword == "kerfuffle" || cleanword == "sharbert" || cleanword == "fornax" {
-			splitted[i] = "****"
-		}
-	}
+  userUUID, err := uuid.Parse(reqbody.UserId)
+  if err != nil {
+    respondWithError(w, http.StatusBadRequest, "Invalid user ID", err)
+    return
+  }
+  user, err := cfg.db.CreateChirp(r.Context(), database.CreateChirpParams{ Body: reqbody.Body,
+    UserID: userUUID,
+  })
+  if err != nil {
+    respondWithError(w, http.StatusInternalServerError, "Couldn't create chirp", err)
+    return
+  }
+  resUser := Chirp{
+    ID: user.ID,
+    CreatedAt: user.CreatedAt,
+    UpdatedAt: user.UpdatedAt,
+    Body: user.Body,
+    UserID: user.UserID,
+  }
+	respondWithJSON(w, http.StatusCreated, resUser)
+}
 
-	resBody := validResParameters{
-		Cleaned_Body: strings.Join(splitted, " "),
-	}
-	log.Println(resBody.Cleaned_Body)
-	respondWithJSON(w, http.StatusOK, resBody)
+type User struct {
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Email     string    `json:"email"`
+	ID        uuid.UUID `json:"id"`
+}
+
+func (cfg *apiConfig) usersHandler(w http.ResponseWriter, r *http.Request){
+  if r.Method != http.MethodPost {
+    respondWithError(w, http.StatusMethodNotAllowed, "method not supported", nil)
+    return
+  }
+  decoder := json.NewDecoder(r.Body)
+  reqBody := struct{
+    Email string `json:"email"`
+  }{}
+  err := decoder.Decode(&reqBody)
+  if err != nil {
+    respondWithError(w, 500, "Error while decoding", err)
+    return
+  }
+  user, err := cfg.db.CreateUser(r.Context(), reqBody.Email)
+  if err != nil {
+    respondWithError(w, 500, "Error while creating user", err)
+    return
+  }
+  apiUser := User{
+    ID: user.ID,
+    CreatedAt: user.CreatedAt,
+    UpdatedAt: user.UpdatedAt,
+    Email: user.Email,
+  }
+  respondWithJSON(w, 201, apiUser)
+}
+
+func (cfg *apiConfig) getAllChirpsHandler(w http.ResponseWriter, r *http.Request){
+  chirpSlice, err := cfg.db.GetAllChirps(r.Context())
+  if err != nil {
+    respondWithError(w, 500, "Error getting all the chirps", err)
+    return
+  }
+  res := []Chirp{}
+  for _, v := range chirpSlice {
+    resUser := Chirp{
+      ID: v.ID,
+      CreatedAt: v.CreatedAt,
+      UpdatedAt: v.UpdatedAt,
+      Body: v.Body,
+      UserID: v.UserID,
+    }
+    res = append(res, resUser)
+  }
+  respondWithJSON(w,http.StatusOK, res)
+}
+
+func (cfg *apiConfig) getChirpsByIdHandler(w http.ResponseWriter, r *http.Request){
+  chirpIdStr := r.PathValue("chirpID")
+  chirpId, err := uuid.Parse(chirpIdStr) 
+      if err != nil {
+          http.Error(w, "Invalid ID format", http.StatusBadRequest)
+          return
+      }
+  chirp, err := cfg.db.GetChirpsById(r.Context(), chirpId)
+  if err != nil {
+    respondWithError(w, http.StatusNotFound, "Not fount Chirp", err)
+    return
+  }
+  resChirp := Chirp{
+    ID: chirp.ID,
+    CreatedAt: chirp.CreatedAt,
+    UpdatedAt: chirp.UpdatedAt,
+    Body: chirp.Body,
+    UserID: chirp.UserID,
+  }
+  respondWithJSON(w, http.StatusOK, resChirp)
 }
 
 func main() {
+  godotenv.Load()
+  dbURL := os.Getenv("DB_URL")
+  platf := os.Getenv("PLATFORM")
+  if dbURL == "" {
+    log.Fatal("DB_URL must be set")
+  }
+  dbConn, err := sql.Open("postgres", dbURL)
+  if err != nil {
+		log.Fatalf("Error opening database: %s", err)
+  }
+  dbQueries := database.New(dbConn)
+  apiCfg := apiConfig{
+		fileserverHits: atomic.Int32{},
+		db:             dbQueries,
+    platform:       platf,
+	}
+
 	const port = "8080"
 	mux := http.NewServeMux()
-	apiCfg := apiConfig{}
 
 	srv := &http.Server{
 		Addr:    ":" + port,
@@ -134,9 +238,14 @@ func main() {
 	}
 
 	mux.Handle("/app/", apiCfg.middlewareMetricsInc(http.StripPrefix("/app/", http.FileServer(http.Dir(".")))))
+
 	mux.HandleFunc("GET /admin/metrics", apiCfg.metricsHandler)
 	mux.HandleFunc("POST /admin/reset", apiCfg.resetHandler)
-	mux.HandleFunc("POST /api/validate_chirp", validateHandler)
+  mux.HandleFunc("POST /api/users", apiCfg.usersHandler)
+  mux.HandleFunc("POST /api/chirps", apiCfg.chirpsHandler)
+  mux.HandleFunc("GET /api/chirps", apiCfg.getAllChirpsHandler)
+  mux.HandleFunc("GET /api/chirps/{chirpID}", apiCfg.getChirpsByIdHandler)
+
 	mux.HandleFunc("GET /api/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("content-type", "text/plain; charset=utf-8")
 		w.WriteHeader(http.StatusOK)

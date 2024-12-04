@@ -22,5 +22,13 @@ POST http://localhost:8080/api/validate_chirp
 Content-Type: application/json
 
 {
-  "body": "this is the body"
+  "body": "this is kerfuffle. sharbert fornax "
 }
+
+### create chirpy user
+POST http://localhost:8080/api/users
+Content-Type: application/json
+
+{
+    "email": "ayan@email.com"
+  }

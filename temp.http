@@ -1,0 +1,26 @@
+### basic get statement
+GET http://api.github.com/users/boltlessengineer
+user-agent: neovim
+
+### basic get statement
+GET https://google.co.in
+
+### chirpy get checkhealthz
+GET http://localhost:8080/api/healthz
+
+### chirpy get assets
+GET http://localhost:8080/app/assets/logo.png
+
+### chirpy get metrics
+GET http://localhost:8080/admin/metrics
+
+### chirpy get reset
+POST http://localhost:8080/admin/reset
+
+### chirpy too long json
+POST http://localhost:8080/api/validate_chirp
+Content-Type: application/json
+
+{
+  "body": "this is the body"
+}

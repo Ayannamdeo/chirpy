@@ -10,11 +10,39 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/google/uuid"
+	"github.com/Ayannamdeo/chirpy/internal/auth"
 	"github.com/Ayannamdeo/chirpy/internal/database"
+	"github.com/google/uuid"
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
 )
+
+func respondWithError(w http.ResponseWriter, status int, msg string, err error) {
+	if err != nil {
+		log.Println(err)
+	}
+	if status >= 500 {
+		log.Printf("Responding with 5XX error: %s", msg)
+	}
+	type errorResponse struct {
+		Error string `json:"error"`
+	}
+	respondWithJSON(w, status, errorResponse{
+		Error: msg,
+	})
+}
+
+func respondWithJSON(w http.ResponseWriter, status int, payload interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	data, err := json.Marshal(payload)
+	if err != nil {
+		w.WriteHeader(500)
+		w.Write(data)
+		return
+	}
+	w.WriteHeader(status)
+	w.Write(data)
+}
 
 type apiConfig struct {
 	db             *database.Queries
@@ -54,33 +82,6 @@ func (cfg *apiConfig) resetHandler(w http.ResponseWriter, r *http.Request) {
   }
   respondWithJSON(w, http.StatusOK, nil)
   cfg.fileserverHits.Store(0)
-}
-
-func respondWithError(w http.ResponseWriter, status int, msg string, err error) {
-	if err != nil {
-		log.Println(err)
-	}
-	if status >= 500 {
-		log.Printf("Responding with 5XX error: %s", msg)
-	}
-	type errorResponse struct {
-		Error string `json:"error"`
-	}
-	respondWithJSON(w, status, errorResponse{
-		Error: msg,
-	})
-}
-
-func respondWithJSON(w http.ResponseWriter, status int, payload interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	data, err := json.Marshal(payload)
-	if err != nil {
-		w.WriteHeader(500)
-		w.Write(data)
-		return
-	}
-	w.WriteHeader(status)
-	w.Write(data)
 }
 
 type chirpsParam struct {
@@ -135,10 +136,10 @@ func (cfg *apiConfig) chirpsHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 type User struct {
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
-	Email     string    `json:"email"`
-	ID        uuid.UUID `json:"id"`
+  CreatedAt time.Time `json:"created_at"`
+  UpdatedAt time.Time `json:"updated_at"`
+  Email     string    `json:"email"`
+  ID        uuid.UUID `json:"id"`
 }
 
 func (cfg *apiConfig) usersHandler(w http.ResponseWriter, r *http.Request){
@@ -146,16 +147,21 @@ func (cfg *apiConfig) usersHandler(w http.ResponseWriter, r *http.Request){
     respondWithError(w, http.StatusMethodNotAllowed, "method not supported", nil)
     return
   }
+	reqBody := struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+	}{}
   decoder := json.NewDecoder(r.Body)
-  reqBody := struct{
-    Email string `json:"email"`
-  }{}
   err := decoder.Decode(&reqBody)
   if err != nil {
     respondWithError(w, 500, "Error while decoding", err)
     return
   }
-  user, err := cfg.db.CreateUser(r.Context(), reqBody.Email)
+  hashedPass, err := auth.HashPassword(reqBody.Password)
+  user, err := cfg.db.CreateUser(r.Context(), database.CreateUserParams{
+    Email: reqBody.Email,
+    HashedPassword: hashedPass,
+  })
   if err != nil {
     respondWithError(w, 500, "Error while creating user", err)
     return
@@ -167,6 +173,35 @@ func (cfg *apiConfig) usersHandler(w http.ResponseWriter, r *http.Request){
     Email: user.Email,
   }
   respondWithJSON(w, 201, apiUser)
+}
+
+func (cfg *apiConfig) loginHandler(w http.ResponseWriter, r *http.Request){
+	reqBody := struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+	}{}
+  if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
+    respondWithError(w, http.StatusInternalServerError, "Error decoding r.body", err)
+    return
+  }
+  user, err := cfg.db.GetUserByEmail(r.Context(), reqBody.Email)
+  if err != nil {
+    log.Printf("Error fetching user: %v", err)
+    respondWithError(w, http.StatusUnauthorized, "incorrect email or password", err)
+    return
+  }
+  if err := auth.CheckPasswordHash(reqBody.Password, user.HashedPassword); err != nil {
+    log.Printf("Password mismatch for user: %s", reqBody.Email)
+    respondWithError(w, http.StatusUnauthorized, "incorrect email or password", err)
+    return
+  }
+  apiUser := User{
+    ID: user.ID,
+    CreatedAt: user.CreatedAt,
+    UpdatedAt: user.UpdatedAt,
+    Email: user.Email,
+  }
+  respondWithJSON(w, http.StatusOK, apiUser)
 }
 
 func (cfg *apiConfig) getAllChirpsHandler(w http.ResponseWriter, r *http.Request){
@@ -241,7 +276,10 @@ func main() {
 
 	mux.HandleFunc("GET /admin/metrics", apiCfg.metricsHandler)
 	mux.HandleFunc("POST /admin/reset", apiCfg.resetHandler)
+
+  mux.HandleFunc("POST /api/login", apiCfg.loginHandler)
   mux.HandleFunc("POST /api/users", apiCfg.usersHandler)
+
   mux.HandleFunc("POST /api/chirps", apiCfg.chirpsHandler)
   mux.HandleFunc("GET /api/chirps", apiCfg.getAllChirpsHandler)
   mux.HandleFunc("GET /api/chirps/{chirpID}", apiCfg.getChirpsByIdHandler)

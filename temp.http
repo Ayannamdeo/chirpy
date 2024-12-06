@@ -17,14 +17,6 @@ GET http://localhost:8080/admin/metrics
 ### chirpy get reset
 POST http://localhost:8080/admin/reset
 
-### chirpy too long json
-POST http://localhost:8080/api/validate_chirp
-Content-Type: application/json
-
-{
-  "body": "this is kerfuffle. sharbert fornax "
-}
-
 ### create chirpy user
 POST http://localhost:8080/api/users
 Content-Type: application/json

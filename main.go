@@ -3,6 +3,7 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -48,6 +49,7 @@ type apiConfig struct {
 	db             *database.Queries
 	platform       string
 	jwtSecret      string
+	polkakey       string
 	fileserverHits atomic.Int32
 }
 
@@ -149,6 +151,7 @@ type User struct {
 	Token        string    `json:"token"`
 	RefreshToken string    `json:"refresh_token"`
 	ID           uuid.UUID `json:"id"`
+  IsChirpyRed bool `json:"is_chirpy_red"`
 }
 
 func (cfg *apiConfig) usersHandler(w http.ResponseWriter, r *http.Request){
@@ -180,10 +183,10 @@ func (cfg *apiConfig) usersHandler(w http.ResponseWriter, r *http.Request){
     CreatedAt: user.CreatedAt,
     UpdatedAt: user.UpdatedAt,
     Email: user.Email,
+    IsChirpyRed: user.IsChirpyRed,
   }
   respondWithJSON(w, 201, apiUser)
 }
-
 
 func (cfg *apiConfig) updateUsersHandler(w http.ResponseWriter, r *http.Request) {
 	reqBody := struct {
@@ -226,6 +229,7 @@ func (cfg *apiConfig) updateUsersHandler(w http.ResponseWriter, r *http.Request)
     UpdatedAt: user.UpdatedAt,
     Email: user.Email,
     ID: user.ID,
+    IsChirpyRed: user.IsChirpyRed,
   }
 
   respondWithJSON(w, http.StatusOK, apiUser)
@@ -283,6 +287,7 @@ func (cfg *apiConfig) loginHandler(w http.ResponseWriter, r *http.Request){
     Email: user.Email,
     Token: accessToken,
     RefreshToken: refreshToken,
+    IsChirpyRed: user.IsChirpyRed,
   }
   respondWithJSON(w, http.StatusOK, apiUser)
 }
@@ -405,11 +410,49 @@ func (cfg *apiConfig) deleteChirpsByIdHandler(w http.ResponseWriter, r *http.Req
   w.WriteHeader(http.StatusNoContent)
 }
 
+func (cfg *apiConfig) webhooksHandler(w http.ResponseWriter, r *http.Request) {
+  apiKey, err := auth.GetAPIKey(r.Header)
+  if err != nil {
+    respondWithError(w, http.StatusUnauthorized, "error getting apiKey from header", err)
+    return
+  }
+  if apiKey != cfg.polkakey {
+    respondWithError(w, http.StatusUnauthorized, "error validating apiKey", err)
+    return
+  }
+	reqBody := struct {
+		Event string `json:"event"`
+		Data  struct {
+			UserId uuid.UUID `json:"user_id"`
+		} `json:"data"`
+	}{}
+  if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
+    respondWithError(w, http.StatusInternalServerError, "error decoding", err)
+    return
+  }
+  if reqBody.Event != "user.upgraded" {
+    w.WriteHeader(http.StatusNoContent)
+    return
+  }
+  _, err = cfg.db.UpgradeToChirpyRed(r.Context(), reqBody.Data.UserId)
+  if errors.Is(err, sql.ErrNoRows){
+    respondWithError(w, http.StatusNotFound, "couldn't fing the user", err)
+    return
+  }
+  if err != nil {
+    respondWithError(w, http.StatusInternalServerError, "Couldn't upgrade to chirpy red", err)
+    return
+  }
+  
+  w.WriteHeader(http.StatusNoContent)
+}
+
 func main() {
   godotenv.Load()
   dbURL := os.Getenv("DB_URL")
   platf := os.Getenv("PLATFORM")
   jwtS := os.Getenv("JWTSECRET")
+  polkaK := os.Getenv("POLKA_KEY")
   if dbURL == "" {
     log.Fatal("DB_URL must be set")
   }
@@ -423,6 +466,7 @@ func main() {
 		db:             dbQueries,
     platform:       platf,
     jwtSecret: jwtS,
+    polkakey: polkaK,
 	}
 
 	const port = "8080"
@@ -439,6 +483,9 @@ func main() {
 	mux.HandleFunc("POST /admin/reset", apiCfg.resetHandler)
 
   mux.HandleFunc("POST /api/login", apiCfg.loginHandler)
+
+  mux.HandleFunc("POST /api/polka/webhooks", apiCfg.webhooksHandler)
+
   mux.HandleFunc("POST /api/refresh", apiCfg.refreshHandler)
   mux.HandleFunc("POST /api/revoke", apiCfg.revokeHandler)
 

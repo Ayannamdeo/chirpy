@@ -47,6 +47,7 @@ func respondWithJSON(w http.ResponseWriter, status int, payload interface{}) {
 type apiConfig struct {
 	db             *database.Queries
 	platform       string
+	jwtSecret      string
 	fileserverHits atomic.Int32
 }
 
@@ -87,6 +88,7 @@ func (cfg *apiConfig) resetHandler(w http.ResponseWriter, r *http.Request) {
 type chirpsParam struct {
 	Body string `json:"body"`
   UserId string `json:"user_id"`
+  Token string `json:"token"`
 }
 
 type Chirp struct {
@@ -102,22 +104,27 @@ func (cfg *apiConfig) chirpsHandler(w http.ResponseWriter, r *http.Request) {
     respondWithError(w, http.StatusMethodNotAllowed, "method not supported", nil)
     return
   }
-	decoder := json.NewDecoder(r.Body)
-	reqbody := chirpsParam{}
-	err := decoder.Decode(&reqbody)
+  reqbody := chirpsParam{}
+	err := json.NewDecoder(r.Body).Decode(&reqbody)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Couldn't decode parameters", err)
 		return
 	}
-	if len(reqbody.Body) > 140 || reqbody.UserId == ""{
-		respondWithError(w, http.StatusBadRequest, "Chirpy is too long or no UserId provided", nil)
-		return
-	}
-  userUUID, err := uuid.Parse(reqbody.UserId)
-  if err != nil {
-    respondWithError(w, http.StatusBadRequest, "Invalid user ID", err)
+  token, err := auth.GetBearerToken(r.Header)
+  if err !=  nil {
+    //what the status type/code for missing parameters or headers?
+    respondWithError(w, 400, "Error getting token", err)
     return
   }
+  userUUID, err := auth.ValidateJWT(token, cfg.jwtSecret)
+  if err != nil {
+    respondWithError(w, http.StatusUnauthorized, "Invalid JWT token", err)
+    return
+  }
+	if len(reqbody.Body) > 140 {
+		respondWithError(w, http.StatusBadRequest, "Chirpy is too long", nil)
+		return
+	}
   user, err := cfg.db.CreateChirp(r.Context(), database.CreateChirpParams{ Body: reqbody.Body,
     UserID: userUUID,
   })
@@ -136,10 +143,12 @@ func (cfg *apiConfig) chirpsHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 type User struct {
-  CreatedAt time.Time `json:"created_at"`
-  UpdatedAt time.Time `json:"updated_at"`
-  Email     string    `json:"email"`
-  ID        uuid.UUID `json:"id"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+	Email        string    `json:"email"`
+	Token        string    `json:"token"`
+	RefreshToken string    `json:"refresh_token"`
+	ID           uuid.UUID `json:"id"`
 }
 
 func (cfg *apiConfig) usersHandler(w http.ResponseWriter, r *http.Request){
@@ -177,9 +186,9 @@ func (cfg *apiConfig) usersHandler(w http.ResponseWriter, r *http.Request){
 
 func (cfg *apiConfig) loginHandler(w http.ResponseWriter, r *http.Request){
 	reqBody := struct {
-		Email    string `json:"email"`
-		Password string `json:"password"`
-	}{}
+	Email            string `json:"email"`
+	Password         string `json:"password"`
+}{}
   if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
     respondWithError(w, http.StatusInternalServerError, "Error decoding r.body", err)
     return
@@ -190,16 +199,43 @@ func (cfg *apiConfig) loginHandler(w http.ResponseWriter, r *http.Request){
     respondWithError(w, http.StatusUnauthorized, "incorrect email or password", err)
     return
   }
+
   if err := auth.CheckPasswordHash(reqBody.Password, user.HashedPassword); err != nil {
     log.Printf("Password mismatch for user: %s", reqBody.Email)
     respondWithError(w, http.StatusUnauthorized, "incorrect email or password", err)
     return
   }
+
+  accessToken, err := auth.MakeJWT(user.ID, cfg.jwtSecret, time.Hour)
+  if err != nil {
+    respondWithError(w, http.StatusInternalServerError, "Error generating accessToken", err)
+    return
+  }
+
+  refreshToken, err := auth.MakeRefreshToken()
+  if err != nil {
+    respondWithError(w, http.StatusInternalServerError, "Error getting refreshToken", err)
+    return 
+  }
+
+  _, err = cfg.db.CreateRefreshToken(r.Context(), database.CreateRefreshTokenParams{
+    Token: refreshToken,
+    UserID: user.ID,
+    ExpiresAt: time.Now().UTC().Add(time.Hour * 24 * 60),
+  })
+
+  if err != nil {
+    respondWithError(w, http.StatusInternalServerError, "Couldn't save refreshToken", err)
+    return
+  }
+
   apiUser := User{
     ID: user.ID,
     CreatedAt: user.CreatedAt,
     UpdatedAt: user.UpdatedAt,
     Email: user.Email,
+    Token: accessToken,
+    RefreshToken: refreshToken,
   }
   respondWithJSON(w, http.StatusOK, apiUser)
 }
@@ -222,6 +258,46 @@ func (cfg *apiConfig) getAllChirpsHandler(w http.ResponseWriter, r *http.Request
     res = append(res, resUser)
   }
   respondWithJSON(w,http.StatusOK, res)
+}
+
+func (cfg *apiConfig) refreshHandler (w http.ResponseWriter, r *http.Request){
+  refreshToken, err := auth.GetBearerToken(r.Header)
+  if err != nil {
+    respondWithError(w, http.StatusBadRequest, "Couldn't find refreshToken", err)
+    return
+  }
+  user, err := cfg.db.GetUserFromRefreshToken(r.Context(), refreshToken)
+  if err != nil {
+    respondWithError(w, http.StatusUnauthorized, "Couldn't get user for refreshToken", err)
+    return
+  }
+  accessToken, err := auth.MakeJWT(user.ID, 
+  cfg.jwtSecret, time.Hour)
+  if err != nil {
+    respondWithError(w, http.StatusUnauthorized, "Couldn't make jwt in /refresh", err)
+    return
+  }
+
+type response struct {
+		Token string `json:"token"`
+	}
+  respondWithJSON(w, http.StatusOK, response{
+    Token: accessToken,
+  })
+}
+
+func (cfg *apiConfig) revokeHandler(w http.ResponseWriter, r *http.Request){
+  refreshToken, err:= auth.GetBearerToken(r.Header)
+  if err != nil {
+    respondWithError(w, http.StatusBadRequest, "Couldn't get refreshToken /revoke", err)
+    return
+  }
+  _, err = cfg.db.RevokeRefreshToken(r.Context(), refreshToken)
+  if err != nil {
+    respondWithError(w, http.StatusInternalServerError, "couldn't revoke refreshToken", err)
+    return
+  }
+  w.WriteHeader(http.StatusNoContent)
 }
 
 func (cfg *apiConfig) getChirpsByIdHandler(w http.ResponseWriter, r *http.Request){
@@ -250,6 +326,7 @@ func main() {
   godotenv.Load()
   dbURL := os.Getenv("DB_URL")
   platf := os.Getenv("PLATFORM")
+  jwtS := os.Getenv("JWTSECRET")
   if dbURL == "" {
     log.Fatal("DB_URL must be set")
   }
@@ -262,6 +339,7 @@ func main() {
 		fileserverHits: atomic.Int32{},
 		db:             dbQueries,
     platform:       platf,
+    jwtSecret: jwtS,
 	}
 
 	const port = "8080"
@@ -278,6 +356,8 @@ func main() {
 	mux.HandleFunc("POST /admin/reset", apiCfg.resetHandler)
 
   mux.HandleFunc("POST /api/login", apiCfg.loginHandler)
+  mux.HandleFunc("POST /api/refresh", apiCfg.refreshHandler)
+  mux.HandleFunc("POST /api/revoke", apiCfg.revokeHandler)
   mux.HandleFunc("POST /api/users", apiCfg.usersHandler)
 
   mux.HandleFunc("POST /api/chirps", apiCfg.chirpsHandler)

@@ -184,6 +184,53 @@ func (cfg *apiConfig) usersHandler(w http.ResponseWriter, r *http.Request){
   respondWithJSON(w, 201, apiUser)
 }
 
+
+func (cfg *apiConfig) updateUsersHandler(w http.ResponseWriter, r *http.Request) {
+	reqBody := struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+	}{}
+	accessToken, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "Couldn't get accessTokne /updateUsersHandler", err)
+		return
+	}
+	userId, err := auth.ValidateJWT(accessToken, cfg.jwtSecret)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "Couldn't validate jwt", err)
+		return
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Error while decoding /updateUsersHandler", err)
+		return
+	}
+
+	hashedPass, err := auth.HashPassword(reqBody.Password)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "couldn't hash password", err)
+		return
+	}
+
+	user, err := cfg.db.UpdateUserById(r.Context(), database.UpdateUserByIdParams{
+		Email:          reqBody.Email,
+		HashedPassword: hashedPass,
+		ID:             userId,
+	})
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "couldn't update the user by id", err)
+		return
+	}
+  apiUser := User{
+    CreatedAt: user.CreatedAt,
+    UpdatedAt: user.UpdatedAt,
+    Email: user.Email,
+    ID: user.ID,
+  }
+
+  respondWithJSON(w, http.StatusOK, apiUser)
+}
+
 func (cfg *apiConfig) loginHandler(w http.ResponseWriter, r *http.Request){
 	reqBody := struct {
 	Email            string `json:"email"`
@@ -322,6 +369,42 @@ func (cfg *apiConfig) getChirpsByIdHandler(w http.ResponseWriter, r *http.Reques
   respondWithJSON(w, http.StatusOK, resChirp)
 }
 
+func (cfg *apiConfig) deleteChirpsByIdHandler(w http.ResponseWriter, r *http.Request){
+  accessToken, err := auth.GetBearerToken(r.Header)
+  if err != nil {
+    respondWithError(w, http.StatusUnauthorized, "Couldn't get accessToken", err)
+    return
+  }
+  userId, err := auth.ValidateJWT(accessToken, cfg.jwtSecret)
+  if err != nil {
+    respondWithError(w, http.StatusUnauthorized, "Couldn't validate jwt", err)
+    return
+  }
+
+  chirpIdStr := r.PathValue("chirpID")
+  chirpId, err := uuid.Parse(chirpIdStr) 
+      if err != nil {
+          http.Error(w, "Invalid ID format", http.StatusBadRequest)
+          return
+      }
+  chirp, err := cfg.db.GetChirpsById(r.Context(), chirpId)
+  if err != nil {
+    respondWithError(w, http.StatusNotFound, "Not fount Chirp", err)
+    return
+  }
+
+  if chirp.UserID != userId {
+    respondWithError(w, http.StatusForbidden, "user is not authorised to perform this action", err)
+    return
+  }
+
+  if err := cfg.db.DeleteChirpsById(r.Context(), chirpId); err != nil {
+    respondWithError(w, http.StatusInternalServerError, "error deleting chirp by id", err)
+    return
+  }
+  w.WriteHeader(http.StatusNoContent)
+}
+
 func main() {
   godotenv.Load()
   dbURL := os.Getenv("DB_URL")
@@ -358,11 +441,14 @@ func main() {
   mux.HandleFunc("POST /api/login", apiCfg.loginHandler)
   mux.HandleFunc("POST /api/refresh", apiCfg.refreshHandler)
   mux.HandleFunc("POST /api/revoke", apiCfg.revokeHandler)
+
   mux.HandleFunc("POST /api/users", apiCfg.usersHandler)
+  mux.HandleFunc("PUT /api/users", apiCfg.updateUsersHandler)
 
   mux.HandleFunc("POST /api/chirps", apiCfg.chirpsHandler)
   mux.HandleFunc("GET /api/chirps", apiCfg.getAllChirpsHandler)
   mux.HandleFunc("GET /api/chirps/{chirpID}", apiCfg.getChirpsByIdHandler)
+  mux.HandleFunc("DELETE /api/chirps/{chirpID}", apiCfg.deleteChirpsByIdHandler)
 
 	mux.HandleFunc("GET /api/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("content-type", "text/plain; charset=utf-8")

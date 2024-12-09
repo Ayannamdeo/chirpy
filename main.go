@@ -10,6 +10,7 @@ import (
 	"os"
 	"sync/atomic"
 	"time"
+  "sort"
 
 	"github.com/Ayannamdeo/chirpy/internal/auth"
 	"github.com/Ayannamdeo/chirpy/internal/database"
@@ -293,10 +294,27 @@ func (cfg *apiConfig) loginHandler(w http.ResponseWriter, r *http.Request){
 }
 
 func (cfg *apiConfig) getAllChirpsHandler(w http.ResponseWriter, r *http.Request){
-  chirpSlice, err := cfg.db.GetAllChirps(r.Context())
-  if err != nil {
-    respondWithError(w, 500, "Error getting all the chirps", err)
-    return
+  s := r.URL.Query().Get("author_id")
+  chirpSlice := []database.Chirp{}
+  if s != "" {
+    authorID_uuid, err := uuid.Parse(s)
+    if err != nil {
+      respondWithError(w, http.StatusBadRequest, "author_id format not correct", err)
+      return
+    }
+    authorId_chirpSlice, err := cfg.db.GetChirpsByUserId(r.Context(), authorID_uuid)
+    if err != nil {
+      respondWithError(w, http.StatusNotFound, "no chirps found for author_id", err)
+      return
+    }
+    chirpSlice = authorId_chirpSlice
+  } else {
+    All_chirpSlice, err := cfg.db.GetAllChirps(r.Context())
+    if err != nil {
+      respondWithError(w, 500, "Error getting all the chirps", err)
+      return
+    }
+    chirpSlice = All_chirpSlice
   }
   res := []Chirp{}
   for _, v := range chirpSlice {
@@ -309,6 +327,19 @@ func (cfg *apiConfig) getAllChirpsHandler(w http.ResponseWriter, r *http.Request
     }
     res = append(res, resUser)
   }
+
+  sortDirection := "asc"
+  sortDirectionParam := r.URL.Query().Get("sort")
+  if sortDirectionParam == "desc" {
+    sortDirection = "desc"
+  }
+  sort.Slice(res, func(i, j int) bool {
+		if sortDirection == "desc" {
+			return res[i].CreatedAt.After(res[j].CreatedAt)
+		}
+		return res[i].CreatedAt.Before(res[j].CreatedAt)
+	})
+
   respondWithJSON(w,http.StatusOK, res)
 }
 
@@ -492,9 +523,9 @@ func main() {
   mux.HandleFunc("POST /api/users", apiCfg.usersHandler)
   mux.HandleFunc("PUT /api/users", apiCfg.updateUsersHandler)
 
-  mux.HandleFunc("POST /api/chirps", apiCfg.chirpsHandler)
   mux.HandleFunc("GET /api/chirps", apiCfg.getAllChirpsHandler)
   mux.HandleFunc("GET /api/chirps/{chirpID}", apiCfg.getChirpsByIdHandler)
+  mux.HandleFunc("POST /api/chirps", apiCfg.chirpsHandler)
   mux.HandleFunc("DELETE /api/chirps/{chirpID}", apiCfg.deleteChirpsByIdHandler)
 
 	mux.HandleFunc("GET /api/healthz", func(w http.ResponseWriter, r *http.Request) {
